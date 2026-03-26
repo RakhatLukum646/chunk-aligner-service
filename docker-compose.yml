@@ -1,0 +1,10 @@
+services:
+  chunk-aligner:
+    build: .
+    image: chunk-aligner-service
+    container_name: chunk-aligner-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    restart: always
