@@ -1,11 +1,17 @@
 import asyncio
+import io
 import json
 import logging
+import mimetypes
 import os
+import subprocess
+import tempfile
 from typing import Any, Dict, List, Literal, Optional, Union
+from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from chunk_aligner import Chunk, create_aligner
@@ -17,9 +23,163 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Chunk Aligner Service",
-    description="Aligns text chunks from two documents using semantic and lexical similarity.",
+    description="Aligns text chunks from two documents using semantic and lexical similarity. Also provides DOCX-to-PDF conversion.",
     version="1.0.0",
 )
+
+
+# -----------------------------------------------------------------------------
+# PDF Conversion Helpers
+# -----------------------------------------------------------------------------
+
+def _make_content_disposition(filename: str, disposition: str = "attachment") -> str:
+    """Build a Content-Disposition header safe for non-ASCII (e.g. Cyrillic) filenames."""
+    try:
+        filename.encode("ascii")
+        return f'{disposition}; filename="{filename}"'
+    except UnicodeEncodeError:
+        encoded = quote(filename, safe="")
+        ascii_fallback = filename.encode("ascii", "ignore").decode("ascii") or "document.pdf"
+        return f"{disposition}; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded}"
+
+
+def convert_docx_to_pdf_unoconv(docx_path: str, output_dir: str) -> str:
+    base_name = os.path.splitext(os.path.basename(docx_path))[0]
+    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+    result = subprocess.run(
+        [
+            "unoconv",
+            "-f", "pdf",
+            "-e", "SelectPdfVersion=1",
+            "-e", "EmbedStandardFonts=true",
+            "-e", "IsSkipEmptyPages=false",
+            "-o", pdf_path,
+            docx_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "HOME": output_dir},
+    )
+    if result.returncode != 0:
+        logger.warning(f"unoconv failed: {result.stderr}")
+        raise RuntimeError(f"unoconv conversion failed: {result.stderr}")
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("PDF file was not created via unoconv")
+    logger.info(f"PDF successfully created via unoconv at {pdf_path}")
+    return pdf_path
+
+
+def convert_docx_to_pdf_libreoffice(docx_path: str, output_dir: str) -> str:
+    result = subprocess.run(
+        [
+            "libreoffice",
+            "--headless",
+            "--nofirststartwizard",
+            "--convert-to", "pdf",
+            "--outdir", output_dir,
+            docx_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "HOME": output_dir},
+    )
+    if result.returncode != 0:
+        logger.error(f"LibreOffice conversion failed: {result.stderr}")
+        raise RuntimeError(f"Conversion error: {result.stderr}")
+    base_name = os.path.splitext(os.path.basename(docx_path))[0]
+    pdf_path = os.path.join(output_dir, f"{base_name}.pdf")
+    if not os.path.exists(pdf_path):
+        raise RuntimeError("PDF file was not created")
+    logger.info(f"PDF successfully created via LibreOffice at {pdf_path}")
+    return pdf_path
+
+
+def convert_docx_to_pdf(docx_path: str, output_dir: str) -> str:
+    """Try unoconv first, fall back to LibreOffice."""
+    try:
+        return convert_docx_to_pdf_unoconv(docx_path, output_dir)
+    except FileNotFoundError:
+        logger.warning("unoconv not found, falling back to LibreOffice")
+    except subprocess.TimeoutExpired:
+        logger.warning("unoconv timed out, falling back to LibreOffice")
+    except RuntimeError as e:
+        logger.warning(f"unoconv failed: {e}, falling back to LibreOffice")
+    except Exception as e:
+        logger.warning(f"unoconv unexpected error: {e}, falling back to LibreOffice")
+
+    try:
+        return convert_docx_to_pdf_libreoffice(docx_path, output_dir)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Conversion timed out")
+    except Exception as e:
+        logger.error(f"Error converting DOCX to PDF: {str(e)}")
+        raise
+
+
+# -----------------------------------------------------------------------------
+# PDF Conversion Endpoint
+# -----------------------------------------------------------------------------
+
+@app.post("/convert-to-pdf/")
+async def convert_to_pdf_endpoint(file: UploadFile = File(...)):
+    """
+    Convert DOCX to PDF, or pass through PDF unchanged.
+    - DOCX input: converts to PDF with embedded fonts (unoconv → LibreOffice fallback)
+    - PDF input: returned as-is
+    - Other formats: returns 400
+    """
+    try:
+        content = await file.read()
+        file_extension = os.path.splitext(file.filename)[1].lower()
+        mime_type = mimetypes.guess_type(file.filename)[0]
+
+        logger.info(f"Received file: {file.filename}, ext: {file_extension}, MIME: {mime_type}")
+
+        if file_extension == ".pdf" or mime_type == "application/pdf":
+            logger.info("File is already PDF, returning as-is")
+            return StreamingResponse(
+                io.BytesIO(content),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": _make_content_disposition(
+                        f"{os.path.splitext(file.filename)[0]}.pdf"
+                    )
+                },
+            )
+
+        elif file_extension == ".docx" or mime_type == "application/vnd.openxmlformats-officedocument.wordprocessingml.document":
+            logger.info("DOCX file detected, converting to PDF")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_docx_path = os.path.join(temp_dir, file.filename)
+                with open(temp_docx_path, "wb") as f:
+                    f.write(content)
+                pdf_path = convert_docx_to_pdf(temp_docx_path, temp_dir)
+                with open(pdf_path, "rb") as f:
+                    pdf_content = f.read()
+            logger.info("Conversion complete")
+            return StreamingResponse(
+                io.BytesIO(pdf_content),
+                media_type="application/pdf",
+                headers={
+                    "Content-Disposition": _make_content_disposition(
+                        f"{os.path.splitext(file.filename)[0]}.pdf"
+                    )
+                },
+            )
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file format. Only DOCX and PDF are supported. Got: {file_extension}",
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing file: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
 
 
 # -----------------------------------------------------------------------------

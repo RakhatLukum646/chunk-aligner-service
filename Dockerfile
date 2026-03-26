@@ -7,7 +7,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     build-essential \
     curl \
-    && rm -rf /var/lib/apt/lists/*
+    unoconv \
+    libreoffice-writer \
+    libreoffice-core \
+    # Fonts for PDF conversion - Liberation fonts are metrically compatible with MS fonts
+    fonts-liberation \
+    fonts-liberation2 \
+    fonts-dejavu-core \
+    fonts-dejavu-extra \
+    fonts-freefont-ttf \
+    fonts-noto-core \
+    fontconfig \
+    && rm -rf /var/lib/apt/lists/* \
+    # Add contrib repository for Microsoft Core Fonts
+    && echo "deb http://deb.debian.org/debian bookworm main contrib" > /etc/apt/sources.list.d/contrib.list \
+    && apt-get update \
+    && echo ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true | debconf-set-selections \
+    && apt-get install -y --no-install-recommends ttf-mscorefonts-installer \
+    && rm -rf /var/lib/apt/lists/* \
+    && fc-cache -f -v
 
 WORKDIR /app
 
