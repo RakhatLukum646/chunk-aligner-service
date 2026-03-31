@@ -53,6 +53,12 @@ class EmbeddingClient:
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for embeddings. Install: pip install httpx")
 
+        if not self.api_url or not self.api_url.startswith(("http://", "https://")):
+            raise ValueError(
+                f"EMBEDDING_API_URL is not set or invalid: {self.api_url!r}. "
+                "Set the EMBEDDING_API_URL environment variable to a valid URL."
+            )
+
         endpoint = f"{self.api_url}/embeddings"
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.api_key:
